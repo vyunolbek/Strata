@@ -288,13 +288,16 @@ public:
         strata::ink::ink_alloc_throws() = !(retry_env && std::atoi(retry_env) == 0);
         struct ThrowGuard { ~ThrowGuard() { strata::ink::ink_alloc_throws() = false; } } throw_guard;
         int chunk_try = std::max(64, opts.chunk);
+        const bool dspark_runs = opts.enable_dspark && model_.man.has_dspark && !model_.ls_active;
         // No --chunk: the memory left after the experts decides (strata/core/ink_chunk.hpp); STRATA_INK_CHUNK_AUTO=0 keeps the old 512.
         if (opts.chunk_auto && !model_.ls_active) {
             const char* auto_env = std::getenv("STRATA_INK_CHUNK_AUTO");
             if (!(auto_env && std::atoi(auto_env) == 0)) {
-                // the K/V still to be allocated for every slot to reach the context stays free of the chunk's working memory (kv offload on: it is host RAM)
+                // the K/V still to be allocated for every slot to reach the context stays free of the chunk's working memory (kv offload on: it is host RAM):
+                // the model's global K/V, and the drafter's own global K/V when it runs (1 layer x 8 heads x 128 x 2 x 2 B = 4 KiB a token, fp16)
                 const double kv_grow_mib = (kv_offload_mode == 1) ? 0.0
-                    : (double)8 * max_slots_ * std::max(0, std::max(256, opts.max_ctx) - init_glob) * (double)per_visit_pos / 1048576.0;
+                    : ((double)8 * max_slots_ * std::max(0, std::max(256, opts.max_ctx) - init_glob) * (double)per_visit_pos
+                       + (dspark_runs ? (double)std::max(256, opts.max_ctx) * 4096.0 : 0.0)) / 1048576.0;
                 chunk_try = std::max(chunk_try, strata::core::ink_auto_chunk(led_loaded, max_slots_, kv_grow_mib));
                 std::fprintf(stderr, "[InkCUDA] prefill chunk %d (auto: %.0f MiB free after the experts, %.0f MiB of K/V still to grow, %d slot(s); --chunk N sets it)\n",
                              chunk_try, led_loaded, kv_grow_mib, max_slots_);
@@ -319,7 +322,7 @@ public:
                 std::fprintf(stderr, "[InkCUDA] STRATA_INK_PROF=1: eager launches, per-phase timing (runner phases every 50 batched steps, host phases every 32)\n");
             }
             try {
-                runner_->init(max_slots_, std::max(256, opts.max_ctx), chunk_try, cuda_kvd, kv_offload_mode);
+                runner_->init(max_slots_, std::max(256, opts.max_ctx), chunk_try, cuda_kvd, kv_offload_mode, dspark_runs);
                 break;
             } catch (const strata::ink::InkAllocFailure& ex) {
                 runner_->free_all();

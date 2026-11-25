@@ -1405,25 +1405,29 @@ struct InkDSpark {
             if (m.man.c.dspark_is_swa[il] != 0) continue;
             if (target <= ctx_cap[il]) continue;
             INK_CK(cudaStreamSynchronize(r.st));
-            const size_t new_elems = (size_t)target * kInkKVHeads * kInkHeadDim;
+            const size_t new_bytes = (size_t)target * kInkKVHeads * kInkHeadDim * sizeof(__half);
             const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim * sizeof(__half);
-            __half *nk = nullptr, *nv = nullptr;
-            if (cudaMalloc(&nk, new_elems * sizeof(__half)) != cudaSuccess ||
-                cudaMalloc(&nv, new_elems * sizeof(__half)) != cudaSuccess) {
-                (void)cudaGetLastError();
-                if (nk) cudaFree(nk);
-                if (nv) cudaFree(nv);
+            // K and V one at a time: the old half is freed before the other half is allocated, so the growth needs one pool more, not two
+            // (RTX 3060 12 GB, SQ-10, 128K, k8v4, --kv-offload off: the target's own K/V growth failed beside this one's double transient)
+            __half** oldp[2]   = {&d_ctx_k[il], &d_ctx_v[il]};
+            bool ok = true;
+            for (int h = 0; h < 2 && ok; ++h) {
+                __half* nh = nullptr;
+                if (cudaMalloc(&nh, new_bytes) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    ok = false;
+                    break;
+                }
+                INK_CK(cudaMemcpy(nh, *oldp[h], old_bytes, cudaMemcpyDeviceToDevice));
+                cudaFree(*oldp[h]);
+                *oldp[h] = nh;
+            }
+            if (!ok) {
                 std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global ctx %d -> %d; disabling DSpark gracefully\n",
                              ctx_cap[il], target);
                 ready = false;
                 return false;
             }
-            INK_CK(cudaMemcpy(nk, d_ctx_k[il], old_bytes, cudaMemcpyDeviceToDevice));
-            INK_CK(cudaMemcpy(nv, d_ctx_v[il], old_bytes, cudaMemcpyDeviceToDevice));
-            cudaFree(d_ctx_k[il]);
-            cudaFree(d_ctx_v[il]);
-            d_ctx_k[il] = nk;
-            d_ctx_v[il] = nv;
             ctx_cap[il] = target;
             grew = true;
         }

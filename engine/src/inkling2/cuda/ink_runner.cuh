@@ -2087,7 +2087,7 @@ struct InkCudaRunner {
         kv_desc[v].host_cap = 0;
     }
 
-    void init(int slots, int ctx, int chunk, InkKvDtype kvd = InkKvDtype::FP16, int kv_offload = 0) {
+    void init(int slots, int ctx, int chunk, InkKvDtype kvd = InkKvDtype::FP16, int kv_offload = 0, bool dspark_runs = false) {
         max_slots = std::max(1, slots);
         max_ctx = std::max(64, ctx);
         kv_offload_mode = kv_offload;
@@ -2139,8 +2139,9 @@ struct InkCudaRunner {
             const size_t swa_kv_bytes = (size_t)n_swa_g0 * max_slots * swa_ring * per_visit_pos;
             const size_t sconv_bytes  = (size_t)(n_swa_g0 + n_glob_g0) * max_slots * 3 * kInkSconvCh * 4;
             const size_t wddm_fl = InkCudaModel::wddm_safety_floor(vtot);
-            // the workspaces the runner still allocates after the K/V (strata/core/ink_kv_reserve.hpp: v0.2.20's values)
-            const size_t ws_reserve = strata::core::ink_runner_ws_reserve_bytes(max_slots, m.man.has_dspark)
+            // the workspaces the runner still allocates after the K/V (strata/core/ink_kv_reserve.hpp: v0.2.20's values), and what a running
+            // DSpark drafter takes at start when the K/V stays on the card (its own K/V is in per_pos_glob below; the rest is measured, see the header)
+            const size_t ws_reserve = strata::core::ink_runner_ws_reserve_bytes(max_slots, m.man.has_dspark, dspark_runs && kv_offload_mode == -1)
                                     + (wddm_fl / 2);
             const size_t avail_glob = (vfree > swa_kv_bytes + sconv_bytes + ws_reserve)
                 ? (vfree - swa_kv_bytes - sconv_bytes - ws_reserve) : 0u;

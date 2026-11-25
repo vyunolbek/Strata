@@ -29,6 +29,28 @@ int main() {
     CHECK(ink_runner_ws_reserve_bytes(7, true) == 800 * MiB);
     CHECK(ink_runner_ws_reserve_bytes(8, false) == 1280 * MiB);
     CHECK(ink_runner_ws_reserve_bytes(64, true) == 1440 * MiB);
+    // a running DSpark drafter with the K/V kept on the card: the 586 - 76 MiB it took at start on top (measured, RTX 3060 12 GB)
+    CHECK(kInkWsReserveDsparkRunBytes == 512 * MiB);
+    CHECK(ink_runner_ws_reserve_bytes(1, true, true) == 1312 * MiB);
+    CHECK(ink_runner_ws_reserve_bytes(8, true, true) == 1952 * MiB);
+    CHECK(ink_runner_ws_reserve_bytes(1, false, true) == 1152 * MiB);
+    CHECK(ink_runner_ws_reserve_bytes(1, true, false) == 800 * MiB);          // the host-offload window: as before
+
+    // The same card with 4.0 / 4.4 GiB of experts on it, 128K, k8v4 (1 600 B a position per visit incl. scales), the K/V kept on the card
+    // (--kv-offload off) and the drafter on: 3768 / 3360 MiB free after the experts, SWA ring + ShortConv 495 MiB. v0.1.67 claimed 131 072 /
+    // 126 656 and the global K/V ran out of the card at 111 104 / 84 480 tokens; with the drafter's start-up cost reserved, the context is
+    // sized below where the card really ran out.
+    const size_t v4[2] = {3768 * MiB, 3360 * MiB};
+    const int exhausted[2] = {111104, 84480};
+    const size_t per_k8v4 = 8 * 1600 + 4096;
+    for (int i = 0; i < 2; ++i) {
+        const int old_fit = window(v4[i], 495 * MiB, ink_runner_ws_reserve_bytes(1, true), per_k8v4, 131072);
+        const int new_fit = window(v4[i], 495 * MiB, ink_runner_ws_reserve_bytes(1, true, true), per_k8v4, 131072);
+        CHECK(old_fit > exhausted[i]);                   // claimed more than the card held
+        CHECK(new_fit <= exhausted[i]);                  // honest: no request can reach the point where it ran out
+        std::printf("RTX 3060, %.1f GiB of experts, 128K k8v4 on the card, DSpark on: context %d -> %d tokens (ran out at %d)\n",
+                    v4[i] / (1024.0 * 1024.0) / 1024.0, old_fit, new_fit, exhausted[i]);
+    }
 
     // RTX 3060 12 GB, SQ-10, 32K, 1 slot, 1.60 GiB free at the decision, SWA ring + ShortConv 495 MiB (fitted: it reproduces both measured windows),
     // per-position K/V of the 8 global visits 32 KiB (+4 KiB for the drafter's own)
