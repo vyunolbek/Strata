@@ -50,6 +50,12 @@ MAX_PARALLEL = 64
 # 8 global visits x 8 kv_heads x 128 head_dim x 2 (K+V) x 2 bytes (FP16) = 32,768 B/token
 GLOBAL_KV_BYTES_PER_TOK_FP16 = 32768
 GLOBAL_KV_BYTES_PER_TOK_FP8 = 16384
+#: The global K/V of one token by the engine's --kv format (8 global visits x 8 kv_heads x 128 head_dim x K+V): k8v4 is INT8 K + rotated 4-bit V,
+#: 12 KiB (measured: strata-inkling 0.1.67 keeps 72 704 of 262 144 tokens on an RTX 3060 with 852 MiB of K/V room).
+GLOBAL_KV_BYTES_PER_TOK_K8V4 = 12288
+GLOBAL_KV_BYTES_PER_TOK = {"fp16": GLOBAL_KV_BYTES_PER_TOK_FP16, "fp8": GLOBAL_KV_BYTES_PER_TOK_FP8,
+                           "k8v8": GLOBAL_KV_BYTES_PER_TOK_FP8, "k8v4": GLOBAL_KV_BYTES_PER_TOK_K8V4}
+KV_FORMATS = tuple(GLOBAL_KV_BYTES_PER_TOK)        # --kv words strata-inkling takes on CUDA (auto is the planner's own rule)
 # 40 SWA-1024 visits x 1024 x 8 x 128 x 2 x 2 B = 167,772,160 B (~0.168 GB) + 3.83 MB ShortConv
 SWA_AND_SCONV_GB_FP16 = 0.172
 SWA_AND_SCONV_GB_FP8 = 0.088
@@ -139,19 +145,26 @@ def dspark_gb(ctx: int | None = None, enabled: bool = True, parallel: int = 1, b
     return round(DSPARK_BASE_GB + n * DSPARK_KV_BYTES_PER_TOK / 1e9, 3)
 
 
-def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False, backend: str | None = None) -> float:
+def _per_tok_bytes(kv_fmt: str | None, fp8_kv: bool) -> int:
+    """Global K/V bytes per token: the --kv format the person chose when it is one of KV_FORMATS, else the 8-bit / 16-bit rule."""
+    f = str(kv_fmt or "").strip().lower()
+    return GLOBAL_KV_BYTES_PER_TOK[f] if f in GLOBAL_KV_BYTES_PER_TOK else (GLOBAL_KV_BYTES_PER_TOK_FP8 if fp8_kv else GLOBAL_KV_BYTES_PER_TOK_FP16)
+
+
+def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False, backend: str | None = None,
+                kv_fmt: str | None = None) -> float:
     """KV + SWA-1024 + ShortConv state in GB for `ctx` context tokens across `parallel` concurrent request slots."""
     n = DEFAULT_CONTEXT if ctx is None else max(1024, int(ctx))
     slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
     if _full_ctx_slots(backend):
         return round(slots * (n * GLOBAL_KV_BYTES_PER_TOK_FP16 / 1e9 + SWA_AND_SCONV_GB_FP16), 3)
     if fp8_kv or slots >= 16:
-        per_tok = GLOBAL_KV_BYTES_PER_TOK_FP8 / 1e9
+        per_tok = _per_tok_bytes(kv_fmt, True) / 1e9
         fixed = SWA_AND_SCONV_GB_FP8
         # Continuous batching allocates paged SWA blocks & global KV on demand per slot; budget realistic active occupancy
         active_ctx = min(n, 4096) if slots >= 16 else n
     else:
-        per_tok = GLOBAL_KV_BYTES_PER_TOK_FP16 / 1e9
+        per_tok = _per_tok_bytes(kv_fmt, False) / 1e9
         fixed = SWA_AND_SCONV_GB_FP16
         active_ctx = n
     return round(slots * (active_ctx * per_tok + fixed), 3)
@@ -172,27 +185,28 @@ def auto_fp8_kv(vram_gib: float | None, ctx: int | None = None, parallel: int = 
     return False
 
 
-def global_kv_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False, backend: str | None = None) -> float:
+def global_kv_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False, backend: str | None = None,
+                  kv_fmt: str | None = None) -> float:
     """Global KV cache size in GB across the 8 global visits (spillable to mapped pinned host RAM via --kv-offload)."""
     n = DEFAULT_CONTEXT if ctx is None else max(1024, int(ctx))
     slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
     if _full_ctx_slots(backend):
         return round(slots * n * GLOBAL_KV_BYTES_PER_TOK_FP16 / 1e9, 3)
     if fp8_kv or slots >= 16:
-        per_tok = GLOBAL_KV_BYTES_PER_TOK_FP8 / 1e9
+        per_tok = _per_tok_bytes(kv_fmt, True) / 1e9
         active_ctx = min(n, 4096) if slots >= 16 else n
     else:
-        per_tok = GLOBAL_KV_BYTES_PER_TOK_FP16 / 1e9
+        per_tok = _per_tok_bytes(kv_fmt, False) / 1e9
         active_ctx = n
     return round(slots * active_ctx * per_tok, 3)
 
 
-def global_kv_total_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False) -> float:
+def global_kv_total_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False, kv_fmt: str | None = None) -> float:
     """All the global K/V of `parallel` slots at `ctx` tokens: what the mapped host K/V holds when the engine offloads it. Measured (strata-inkling, RTX 3060,
     SQ-10, ctx 32768): the host share is slots x (ctx - the on-device window) x bytes per token, 3.4 GiB at 4 slots (FP16) ... 31.7 GiB at 64 slots (FP8)."""
     n = DEFAULT_CONTEXT if ctx is None else max(1024, int(ctx))
     slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
-    per_tok = (GLOBAL_KV_BYTES_PER_TOK_FP8 if (fp8_kv or slots >= 16) else GLOBAL_KV_BYTES_PER_TOK_FP16) / 1e9
+    per_tok = _per_tok_bytes(kv_fmt, fp8_kv or slots >= 16) / 1e9
     return round(slots * n * per_tok, 3)
 
 
@@ -205,7 +219,7 @@ def swa_sconv_gb(parallel: int = 1, fp8_kv: bool = False, backend: str | None = 
 
 def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False, *,
                   dspark: bool = True, fp8_kv: bool = False, hybrid: bool = False,
-                  host_offload_global_kv: bool = False, backend: str | None = None) -> float:
+                  host_offload_global_kv: bool = False, backend: str | None = None, kv_fmt: str | None = None) -> float:
     """Video memory kept free of expert bodies: driver/desktop + hybrid workspace + DSpark KV + KV/SWA/ShortConv (+ peak KV growth margin + Vision shard)."""
     slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
     kv_ctx = ctx
@@ -215,7 +229,7 @@ def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = Fals
         kv_vram = swa_sconv_gb(parallel, fp8_kv=fp8_kv, backend=backend)
     else:
         grow = 1.0 if _full_ctx_slots(backend) else KV_GROW_FACTOR       # SYCL allocates the whole K/V once: there is no growth to leave room for
-        kv_vram = round(global_kv_gb(kv_ctx, parallel, fp8_kv=fp8_kv, backend=backend) * grow
+        kv_vram = round(global_kv_gb(kv_ctx, parallel, fp8_kv=fp8_kv, backend=backend, kv_fmt=kv_fmt) * grow
                         + swa_sconv_gb(parallel, fp8_kv=fp8_kv, backend=backend), 3)
     return round(
         VRAM_DRIVER_GB
@@ -290,7 +304,8 @@ def bodies_gb_for(build: str, backend: str | None = None) -> float:
 def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False,
             parallel: int = 1, dspark: bool = True, kv_offload: str = "auto", *,
             extra_vram_gib: float = 0.0, backend: str | None = None,
-            desktop: bool = False, ram_free_gib: float | None = None, fp8_kv: bool | None = None, sm: int | None = None) -> dict:
+            desktop: bool = False, ram_free_gib: float | None = None, fp8_kv: bool | None = None, sm: int | None = None,
+            kv_fmt: str | None = None) -> dict:
     """Placement of `build` on a discrete-GPU PC (vram_gib + optional extra_vram_gib + ram_gib): GB of experts in VRAM, in RAM, and on SSD.
 
     Implements the unified 4-tier adaptive contract (GPU -> RAM+CPU -> SSD) with Host KV Offloading (#552),
@@ -299,6 +314,9 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
 
     vram_gib is the card's FREE memory (what is left after the desktop and other programs), ram_free_gib the free RAM
     (None: not known, the total in ram_gib counts); desktop says the card drives a display (a larger reserve) (#6662 #6739).
+    kv_fmt is the --kv format the person chose (fp16, fp8, k8v8, k8v4): the global K/V is sized by it (k8v4 is 12 KiB a token, not
+    the 16 KiB of fp8 the plan counted, and not the 32 KiB of FP16 when no format was named), so the experts get the room that is
+    really left. None keeps the planner's own rule.
     """
     info = dict(BUILDS[build])
     info["bodies_gb"] = bodies_gb_for(build, backend)      # GGUF experts a backend converts at load take their converted size
@@ -320,7 +338,13 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
         fp8_kv = auto_fp8_kv(v_gib, ctx, parallel, kv_offload=effective_offload, backend=backend_low)
     elif _full_ctx_slots(backend_low):
         fp8_kv = False
-    kv_dtype = "fp8" if fp8_kv else "fp16"
+    kv_fmt = str(kv_fmt or "").strip().lower() or None
+    if kv_fmt in KV_FORMATS and not _full_ctx_slots(backend_low):
+        fp8_kv = kv_fmt != "fp16"       # the chosen format: fp8 / k8v8 / k8v4 are the 8-bit family (the SWA ring and ShortConv follow)
+        kv_dtype = kv_fmt
+    else:
+        kv_fmt = None                   # a format this backend does not have (HIP, SYCL, Metal turn k8v4 / k8v8 into fp8): the rule above stands
+        kv_dtype = "fp8" if fp8_kv else "fp16"
     # The Q8_0 drafter file (0.40 GB) is NOT a further charge on a discrete card: measured on an RTX 3060 Ti 8 GB (SQ-10 and UD-Q4_K_XL, free
     # 7.66 GiB, ctx 32768) the engine places only 81 / 41 fewer experts (0.23 / 0.19 GB) with the drafter on, and its ledger shows DSpark taking 78-80 MiB;
     # the planner charged 0.25 GB for SQ and 0.65 GB for GGUF (0.40 of it for the weights), 0.45 GB too much on a tight card. Unified memory still holds it.
@@ -328,7 +352,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
     # Vision stays in host RAM / CPU on <= 12.5 GiB GPUs so it never steals ~0.64 GB of hot 3x-looped expert VRAM!
     vision_in_vram = bool(vision and v_gib > 12.5)
     # the K/V that goes to the host (CUDA only): every slot's whole context, not the on-device window the card keeps (#--parallel measured, see global_kv_total_gb)
-    glob_kv = global_kv_total_gb(ctx, parallel, fp8_kv=fp8_kv) if supports_host_kv else global_kv_gb(ctx, parallel, fp8_kv=fp8_kv, backend=backend_low)
+    glob_kv = global_kv_total_gb(ctx, parallel, fp8_kv=fp8_kv, kv_fmt=kv_fmt) if supports_host_kv else global_kv_gb(ctx, parallel, fp8_kv=fp8_kv, backend=backend_low, kv_fmt=kv_fmt)
     ram_avail_for_model = max(0.0, ram_gb - OS_RESERVE_GB - (VISION_GB if vision else 0.0))
     if ram_free_gib is not None:        # the free RAM, not the installed RAM: what other programs hold is not there to give
         ram_avail_for_model = max(0.0, min(ram_avail_for_model,
@@ -336,7 +360,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
 
     # 1. Try 100%-VRAM expert residency with VRAM-resident global KV first
     full_need = dense_total + info["bodies_gb"] + non_expert_gb(
-        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=False, host_offload_global_kv=False, backend=backend_low
+        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=False, host_offload_global_kv=False, backend=backend_low, kv_fmt=kv_fmt
     )
     # CUDA: a K/V that fills the card to within a few hundred MB grows into whatever the desktop takes next; with that little to spare the K/V goes to host RAM
     # (the experts stay all in the card, the engine keeps the window of every slot there) when the RAM can hold it (#6905: a 16 GB card, 64K, vision, 0.4 GB to spare)
@@ -359,7 +383,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
     # (measured: SQ-15 on an A4000 16 GB, RESULTS-0221-INKCUDA.md); an unnamed backend keeps the older rule (<= 13 GiB or asked)
     auto_offload_full = can_offload_kv and (effective_offload == "on" or v_gib <= 13.0 or backend_low == "cuda")
     full_need_offload = dense_total + info["bodies_gb"] + non_expert_gb(
-        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=False, host_offload_global_kv=True, backend=backend_low
+        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=False, host_offload_global_kv=True, backend=backend_low, kv_fmt=kv_fmt
     )
     if vram_gb > 0.0 and auto_offload_full and full_need_offload <= vram_gb:
         return {
@@ -376,7 +400,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
     use_host_kv = can_offload_kv and (effective_offload == "on" or v_gib <= 13.0 or glob_kv > 1.5)
     host_kv_used = glob_kv if use_host_kv else 0.0
     gpu_room = max(0.0, vram_gb - dense_total - non_expert_gb(
-        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=True, host_offload_global_kv=use_host_kv, backend=backend_low
+        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=True, host_offload_global_kv=use_host_kv, backend=backend_low, kv_fmt=kv_fmt
     ))
     ram_room = max(0.0, ram_avail_for_model - host_kv_used)
     in_vram = min(info["bodies_gb"], gpu_room)
@@ -389,7 +413,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
         # What the slots add to what one slot already needs (the start-up of ONE slot on a tiny card is measured: SQ-10 starts on 4 GiB with every
         # expert in RAM, the engine shrinks its workspaces): the per-slot SWA rings / ShortConv state / drafter K/V / workspaces of N slots,
         # and the global K/V when it is not moved to the host. That must fit the card beside the dense weights and the one-slot base.
-        one = dict(vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=True, host_offload_global_kv=True, backend=backend_low)
+        one = dict(vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=True, host_offload_global_kv=True, backend=backend_low, kv_fmt=kv_fmt)
         base = non_expert_gb(ctx, 1, **one)
         slot_extra = max(0.0, non_expert_gb(ctx, parallel, **one) - base)
         kv_in_card = 0.0
@@ -440,11 +464,13 @@ def compute_unified(build: str, pool_gib: float, ctx: int | None = None, vision:
 def place(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None,
           vision: bool = False, parallel: int = 1, dspark: bool = True, *,
           extra_vram_gib: float = 0.0, backend: str | None = None,
-          desktop: bool = False, ram_free_gib: float | None = None, fp8_kv: bool | None = None, sm: int | None = None) -> dict:
+          desktop: bool = False, ram_free_gib: float | None = None, fp8_kv: bool | None = None, sm: int | None = None,
+          kv_fmt: str | None = None, kv_offload: str = "auto") -> dict:
     if unified:
         return compute_unified(build, ram_gib, ctx, vision, parallel, dspark, backend=backend)
-    return compute(build, vram_gib or 0.0, ram_gib, ctx, vision, parallel, dspark,
-                   extra_vram_gib=extra_vram_gib, backend=backend, desktop=desktop, ram_free_gib=ram_free_gib, fp8_kv=fp8_kv, sm=sm)
+    return compute(build, vram_gib or 0.0, ram_gib, ctx, vision, parallel, dspark, kv_offload=kv_offload,
+                   extra_vram_gib=extra_vram_gib, backend=backend, desktop=desktop, ram_free_gib=ram_free_gib, fp8_kv=fp8_kv, sm=sm,
+                   kv_fmt=kv_fmt)
 
 
 def mode(placed: dict | float) -> str:

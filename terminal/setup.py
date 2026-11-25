@@ -10594,16 +10594,30 @@ def inkling_plan_extra(gpu) -> dict:
 
 
 def inkling_plan_kv(a, backend) -> dict:
-    """The K/V type the person chose, for the HIP plan only (#7022): fp8 or fp16 is planned as asked (the plan assumed FP16 on a card of more than 13 GiB, twice the K/V of an
-    --kv fp8 start); no choice, or another backend, leaves the planner's own rule (the other backends' plans are the ones they always were)."""
-    if backend != "hip":
-        return {}
+    """The K/V type the person chose, for the plan. #7022 did it for HIP; CUDA plans it too, where k8v4 is a real format:
+    fp8, k8v8 and k8v4 are the 8-bit family, and k8v4 is 12 KiB a token, a quarter less than the fp8 the plan counted, so the experts get
+    the room that is really left. HIP, Metal and SYCL turn k8v8 / k8v4 into fp8 (inkling_kv_note), so HIP plans fp8 as before and the other two
+    keep the planner's own rule. fp16 is planned as fp16. No choice leaves the planner's own rule on every backend.
+    --kv-offload says where the K/V lives: with `off` the plan keeps the whole context's K/V on the card (RTX 3060 12 GB, SQ-10, 128K,
+    k8v4: 3.37 GiB of experts instead of the 5.57 it gave when it thought the K/V would go to host RAM, where the engine then found the
+    card full at 65K tokens)."""
     asked = str(getattr(a, "kv", None) or "").strip().lower()
-    if asked in ("fp8", "k8v8", "k8v4"):                  # setup turns k8v8 / k8v4 into fp8 on HIP (below)
-        return {"fp8_kv": True}
-    if asked == "fp16":
-        return {"fp8_kv": False}
-    return {}
+    out: dict = {}
+    if asked in ("fp8", "k8v8", "k8v4"):
+        if backend == "hip" and asked in ("k8v8", "k8v4"):        # setup turns k8v8 / k8v4 into fp8 on HIP (below)
+            out = {"fp8_kv": True}
+        elif backend == "cuda":
+            out = {"fp8_kv": True, "kv_fmt": asked}
+        elif backend == "hip":
+            out = {"fp8_kv": True}
+    elif asked == "fp16" and backend in ("hip", "cuda"):
+        out = {"fp8_kv": False}
+        if backend == "cuda":
+            out["kv_fmt"] = "fp16"
+    offload = str(getattr(a, "kv_offload", None) or "").strip().lower()
+    if offload in ("on", "off") and backend == "cuda":        # only CUDA maps the global K/V to host RAM (#6613)
+        out["kv_offload"] = offload
+    return out
 
 
 def inkling_menu_lines(vram_gib, ram_gib, unified, ctx=None, vision=inkling_family.DEFAULT_VISION, *, igpu=False, arch=None, extra=None) -> list:
@@ -10931,6 +10945,9 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             warn(f"--kv {kv_asked} is not supported for {fam['title']} on {ink_backend}; using --kv fp8 instead")
             kv_asked = "fp8"
         args += ["--kv", kv_asked]
+    kv_offload_asked = str(getattr(a, "kv_offload", None) or "").strip().lower()
+    if kv_offload_asked in ("on", "off") and ink_backend == "cuda":   # the plan kept room for it (inkling_plan_kv): the engine must do the same
+        args += ["--kv-offload", kv_offload_asked]
     if drafting_mode == "off":
         args += ["--draft", "off"]
     if vision and vision_path is not None:
@@ -11496,6 +11513,10 @@ def main() -> int:
     ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16", "fp8", "k8v8"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise) k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell) or fp16 (16-bit, twice the memory of int8)")
+    ap.add_argument("--kv-offload", choices=["auto", "on", "off"],
+                    help="Inkling-2-Mini: where the conversation memory (K/V) beyond the card's window lives. auto (default): the engine keeps a window in "
+                         "graphics memory and maps the rest in RAM; off: all of it stays in graphics memory and the plan leaves room for it (fewer experts "
+                         "on the card). `strata launch --set kv-offload=off` passes it here and to the engine")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (on by default where the model can; yes = the best reader for this card: the CPU "
                          "under 24 GB of VRAM, the GPU from 24 GB, any make; gpu / cpu = that reader; no = text only)")

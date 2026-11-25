@@ -1376,6 +1376,11 @@ class Runner:
             args += ["--drafter", "off"]
         if self.is_inkling() and s.parallel and int(s.parallel) > 1:
             args += ["--parallel", str(int(s.parallel))]     # setup plans the experts in graphics memory with room for these slots
+        # --set kv-offload=off: the plan must keep the whole context's K/V on the card, or it gives the experts the room the K/V needs
+        # and the engine then shrinks the context (RTX 3060 12 GB, SQ-10, 128K: 65 280 tokens instead of 131 072)
+        offload = str(s.extra.get("--kv-offload", "") or "").strip().lower() if self.is_inkling() else ""
+        if offload in ("on", "off") and sys.platform != "darwin":
+            args += ["--kv-offload", offload]
         if self.is_native_strata_family() and not WINDOWS and sys.platform != "darwin":
             try:
                 from strata_control import engine_component

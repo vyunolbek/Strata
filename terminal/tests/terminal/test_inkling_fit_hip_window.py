@@ -85,10 +85,14 @@ class HipKvChoice(unittest.TestCase):
         self.assertEqual(self.kv(None, "hip"), {})
         self.assertEqual(self.kv("auto", "hip"), {})
 
-    def test_other_backends_are_left_alone(self):
-        for backend in ("cuda", "sycl", "metal", None):
+    def test_the_other_two_backends_are_left_alone(self):
+        for backend in ("sycl", "metal", None):
             for asked in ("fp8", "fp16", "k8v8", "k8v4", ""):
                 self.assertEqual(self.kv(asked, backend), {}, (backend, asked))
+
+    def test_cuda_plans_k8v4_as_what_it_is(self):                        # tests/terminal/test_inkling_fit_kv_format.py has the plan
+        self.assertEqual(self.kv("k8v4", "cuda"), {"fp8_kv": True, "kv_fmt": "k8v4"})
+        self.assertEqual(self.kv("fp8", "cuda"), {"fp8_kv": True, "kv_fmt": "fp8"})
 
     def test_fp8_gives_the_card_more_experts(self):
         auto = hip(ctx=131072)
