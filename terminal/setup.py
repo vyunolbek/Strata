@@ -10572,6 +10572,39 @@ def inkling_expert_flags(placed, ram_free_gib=None, backend=None) -> list:
     return flags
 
 
+HELD_CARD_SHARE = 0.60      # a card with less than this share of its memory free when the plan is made is held by another program
+
+
+def inkling_held_card(gpu, vram_gib) -> tuple[float, float] | None:
+    """(free GiB, total GiB) of a discrete card that is mostly held by another program when the plan is made, else None.
+
+    #6662 made the plan from the card's FREE memory, which is right for a browser on the desktop; a card that is nearly full gets a plan
+    with the experts in RAM and, until now, no word about why. Measured: an RTX 3060 12 GB showed 0.1 GiB free right after a server had
+    been killed and a launch followed at once; the plan gave the experts 0.00 GiB on the card and 6.76 GiB in RAM (9.8 tok/s, all from RAM)."""
+    g = gpu or {}
+    total = float(g.get("vram_gb") or 0.0)
+    free = g.get("free_gb")
+    if g.get("uma") or g.get("unified") or total <= 0.0 or not isinstance(free, (int, float)) or isinstance(free, bool):
+        return None
+    try:
+        used_by_plan = float(vram_gib)
+    except (TypeError, ValueError):
+        return None
+    if used_by_plan > total * HELD_CARD_SHARE:
+        return None
+    return float(free), total
+
+
+def inkling_held_card_words(held: tuple[float, float], placed: dict) -> str:
+    """The warning for a card that is held when the plan is made: the numbers the person can check (free of total, what the plan does)."""
+    ssd = float(placed.get("ssd_gb", 0.0) or 0.0)
+    on_ssd = f" and {ssd:.1f} GB on the SSD" if ssd > 0.05 else ""
+    return (f"The graphics card has only {held[0]:.1f} GiB free of {held[1]:.1f} GiB right now, so another program holds the rest (a game, a browser, "
+            f"a video, or a server that has not exited yet). The plan keeps {float(placed['vram_gb']):.1f} GB of the experts on the card and "
+            f"{float(placed['ram_gb']):.1f} GB in system memory{on_ssd}, which is slower than a card with room. Close what holds the card "
+            "(or run `strata launch --stop` for a server of Strata's own), wait a few seconds, and start again.")
+
+
 def inkling_plan_extra(gpu) -> dict:
     """What the Inkling planner is told beside the card's free memory (#6662 #6739): the free RAM, and that the card drives a display
     (the desktop keeps a larger reserve).  Missing keys mean not known."""
@@ -10836,6 +10869,9 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if mode == "cross_tier_ssd":
         warn(f"{model} exceeds this PC's memory: about {placed['ssd_gb']:.1f} GB stream from SSD ({rec['build']} fits better)")
     ok(f"context: {ctx} tokens")
+    held = inkling_held_card(gpu, vram_gib)
+    if held is not None and placed["ram_gb"] + placed.get("ssd_gb", 0.0) > 0.05:
+        warn(inkling_held_card_words(held, placed))
     folder = inkling_folder(a)
     own = bool(getattr(a, "gguf_dir", None))
     local_src = inkling_local_source(a, model) if own else None
