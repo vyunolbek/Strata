@@ -296,6 +296,17 @@ class Advanced(unittest.TestCase):
         self.assertEqual(a, {"--prefill": "65536", "--kv-grow": True, "--spec": None})
         self.assertEqual(e, {"STRATA_PIN_BY_NEED": "1"})
 
+    def test_word_flags_keep_their_word(self):
+        from strata_control import tune_knobs
+        # the Inkling-2-Mini engine reads --kv-offload auto|on|off: "off" is its word, not "remove the option" (a 12 GB card measured:
+        # `--set kv-offload=off` left the engine in auto, K/V mapped in host RAM, 2.8 tok/s at 128K instead of 24)
+        a, _ = S.as_argv_changes({"--kv-offload": "off", "--kv": "auto", "--draft-fallback": "none", "--spec": "off"}, tune_knobs.BOOL_FLAGS)
+        self.assertEqual(a, {"--kv-offload": "off", "--kv": "auto", "--draft-fallback": "none", "--spec": None})
+        a, _ = S.as_argv_changes({"--kv-offload": "", "--vision": ""}, tune_knobs.BOOL_FLAGS)
+        self.assertEqual(a, {})                                            # an empty value is still no change
+        a, _ = S.as_argv_changes({"--vision": "/opt/strata-data/Inkling-2-Mini-Vision.strata"}, tune_knobs.BOOL_FLAGS)
+        self.assertEqual(a, {"--vision": "/opt/strata-data/Inkling-2-Mini-Vision.strata"})   # a file name is never lower-cased
+
 
 class RunConfig(unittest.TestCase):
     BASE = {"exe": "component:strata-engine", "args": ["--native", "x.gguf", "--max-context", "32768", "--kv", "int8", "--prefill", "auto"],
@@ -310,6 +321,17 @@ class RunConfig(unittest.TestCase):
         self.assertIn("--kv-grow", args)
         self.assertEqual(cfg["env"], {"STRATA_PIN_BY_NEED": "1"})
         self.assertEqual(self.BASE["args"][-1], "auto")               # the installed config is never edited
+
+    def test_set_kv_offload_off_reaches_the_engine(self):
+        # `strata launch --set kv-offload=off` used to lose the word: the config carried no --kv-offload and the engine fell back to auto
+        s = S.LaunchSettings(extra={"--kv-offload": "off", "--vram-experts-gb": "4.8"})
+        cfg = derive_config(self.BASE, s, bool_flags=frozenset())
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--kv-offload") + 1], "off")
+        mine = cfg["user_args"]
+        self.assertEqual(mine[mine.index("--kv-offload") + 1], "off")
+        self.assertEqual(mine[mine.index("--vram-experts-gb") + 1], "4.8")
+        self.assertEqual(S.flags_text(S.LaunchSettings(extra={"--kv-offload": "off"})), "strata launch --tune skip --access local --port 8080 --set kv-offload=off")
 
     def test_mtp_off_leaves_the_draft_layer_out_of_this_launch_only(self):
         base = {**self.BASE, "args": [*self.BASE["args"], "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/m/rt"]}

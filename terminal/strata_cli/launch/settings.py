@@ -385,8 +385,13 @@ def settings_from_pairs(pairs: list[str]) -> dict[str, str]:
     return out
 
 
-#: Options whose value is a WORD the engine reads (on, off, auto, none): the word goes through as typed (none since DeepSeek's --dspark left, #3959).
-WORD_VALUE_FLAGS: frozenset[str] = frozenset()
+#: Options whose value is a WORD the engine reads as typed: on, off, auto, none (the Inkling-2-Mini engine's --kv-offload auto|on|off,
+#: the Qwen engine's --draft-fallback mtp|none), or a file name. Without this a value of off/none removes the option and on adds it bare,
+#: so `--set kv-offload=off` reached the engine as no --kv-offload at all and it fell back to auto (host K/V offload on a 12 GB card).
+WORD_VALUE_FLAGS: frozenset[str] = frozenset({
+    "--kv", "--kv-offload", "--draft", "--draft-fallback", "--draft-rule", "--layer-split",   # the engines read words here
+    "--native", "--model", "--vision", "--dspark", "--ple-gguf", "--draft-model",             # files: never lower-cased
+})
 
 
 def as_argv_changes(extra: dict[str, str], bool_flags: frozenset[str],
@@ -401,8 +406,9 @@ def as_argv_changes(extra: dict[str, str], bool_flags: frozenset[str],
         if key.startswith("--"):
             low = value.lower()
             if key in word_flags and key not in bool_flags:
-                if low:
-                    args[key] = low
+                word = value.strip()
+                if word:
+                    args[key] = word                 # as typed: the engine's word or file name, not lower-cased
                 continue                          # an empty value is no change, as for every option that takes one (#3504)
             if low == "" and key not in bool_flags:
                 continue                          # an empty value for an option that takes one is no change, never a bare flag (#3504)
